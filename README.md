@@ -4,7 +4,7 @@ nnremote 是用于本人或明确授权设备的远程桌面应用。iPhone 可�
 
 ## 下载与安装
 
-当前测试版为 [v0.1.0-beta.1](https://github.com/LuckyLivio/nnremote/releases/tag/v0.1.0-beta.1)。首版安装包内的显示名称或可执行文件名仍为 **Livio Remote**，应用内版本为 `0.1.0`。
+当前测试版为 [v0.1.0-beta.2](https://github.com/LuckyLivio/nnremote/releases/tag/v0.1.0-beta.2)。新版应用显示名为 **nnremote**。工程、Bundle ID 和 Windows 可执行文件名沿用初版标识。首版见 [v0.1.0-beta.1](https://github.com/LuckyLivio/nnremote/releases/tag/v0.1.0-beta.1)。
 
 | 平台 | 要求与签名 | 安装 |
 |---|---|---|
@@ -23,11 +23,18 @@ nnremote 是用于本人或明确授权设备的远程桌面应用。iPhone 可�
 
 邀请内包含完整证书指纹和配对密钥，请勿公开转发。收到单次预授权邀请的人可以尝试先行使用该权限。
 
+## 鼠标和 iPhone 手势
+
+- macOS 和 Windows 控制端可在画面内移动指针、按住左右键拖动、双击或使用滚轮。在画面外松手时，拖动坐标限制在远端画面边缘。
+- iPhone 默认使用「触控板」。单指滑动相对移动光标，轻点左击，双指滑动滚动。按住约 0.3 秒后滑动可拖动，松手结束。双击可打开项目，双指轻点为右击。
+- 选择「直接触控」可按画面位置点击，按住再拖动可移动窗口或拖选。直接触控的起始点需位于画面内。手势会转换成远端的鼠标操作。
+- 新旧版仍可使用同一格式的邀请，保留基本点击与滚动。两端均支持扩展指针时才启用按住拖动。仅查看会话不会转发键鼠输入。
+
 ## 网络条件与已知限制
 
 - 局域网直连无需云服务。控制端也可使用已经可达的 IPv4、IPv6、DNS 地址或现成私网。访客 Wi-Fi 的客户端隔离、主机防火墙及网络路由可能影响连通性。
 - `Link/` 是可选的手动配置中继，按邀请填写的地址接入。它转发控制端与主机之间的 TLS 数据，可观察连接时间、地址和流量大小。每个实例支持一台主机、一次一个连接。当前版本尚未实现自动异地发现、NAT 穿透或自动回退。
-- 画面是低帧率单主屏 JPEG，最长边和像素数受采集端限制，最高 1920×1080。首版支持左右键点击、滚动、Unicode 文本和少量常用键。持键拖动、触控板手势、音频、手柄、硬件编码、60 FPS、多屏和文件传输尚未实现。
+- 画面是低帧率单主屏 JPEG，最高 1920×1080。软键盘目前支持发送短文本和少量常用键。画面缩放、原生多点触控、完整组合键、音频、手柄、硬件编码、60 FPS、多屏和文件传输属于后续工作。
 - Win32 输入受系统权限边界约束，UAC 安全桌面及部分提升权限的程序无法操作。macOS 主机需按系统提示授权屏幕录制和辅助功能。首版没有在线账号或设备同步。
 
 ## 构建与测试
@@ -46,12 +53,19 @@ dotnet run --project .\Windows\LivioRemote.csproj
 dotnet publish .\Windows\LivioRemote.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -p:DebugSymbols=false -o .\out\win-x64
 ```
 
-先关闭本机桌面共享，依次运行回环测试，以免争用 TCP `47831`。Python 套件覆盖直连、证书和口令校验、IPv6、中继保留会话 TLS 以及中继重新接入。.NET 套件在生产 Windows 主机传输代码中替换采集和系统输入，覆盖主机批准、仅查看、输入以及单次授权。
+先关闭本机桌面共享，依次运行回环测试，以免争用 TCP `47831`。Python 套件覆盖直连、证书和口令校验、IPv6、中继保留会话 TLS 以及中继重新接入。在 Mac 上还会编译并运行 Swift 测试，验证 Apple 控制端能力协商、移动合并和按钮顺序、画面坐标，以及 macOS 主机按钮事件。.NET 套件用测试画面和输入记录器运行生产 Windows 主机传输代码，验证主机批准、仅查看、断线释放和新旧协议兼容。
 
 ```bash
 python3 -m unittest discover -s Tests -v
 dotnet run --project Tests/WindowsHostTransport/WindowsHostTransport.csproj
 ```
+
+### 实机复测
+
+1. 在同一 Wi-Fi 使用 beta.2 连上 Windows 或 Mac 主机。允许控制后，在桌面拖动窗口，在记事本或文本编辑器拖选文字，双击文件夹并滚动长文档。
+2. iPhone 分别使用触控板与直接触控，横竖屏各测一次。检查画面四角、黑边和高 DPI 主机上的落点。拖到画面外松手，指针应停在边缘，并可继续点击。
+3. 在拖动中切到别的应用、使桌面控制端失焦、断开连接或在主机停止共享。每次检查主机还能正常单击和拖动。再用「仅查看」连接，确认操作不会改变主机状态。
+4. 用 beta.1 与 beta.2 各作为控制端和主机互连，核对点击、滚轮和升级提示。验证结果按连接组合记录。
 
 ### 本地试用中继
 
