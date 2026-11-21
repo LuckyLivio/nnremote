@@ -1,0 +1,12 @@
+bin/
+obj/
+out/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+.DS_Store
+__pycache__/
+livio-relay/
+link.json
+relay-key.pem
+relay.pem
