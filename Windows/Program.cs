@@ -16,7 +16,7 @@ internal sealed class HomeWindow : Form
 {
     public HomeWindow()
     {
-        Text = "Livio Remote";
+        Text = "nnremote";
         Font = new Font("Microsoft YaHei UI", 10);
         StartPosition = FormStartPosition.CenterScreen;
         Size = new Size(520, 300);

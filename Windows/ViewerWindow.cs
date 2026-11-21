@@ -24,7 +24,7 @@ internal sealed class ViewerWindow : Form
 
     public ViewerWindow()
     {
-        Text = "连接电脑 · Livio Remote";
+        Text = "连接电脑 · nnremote";
         Font = new Font("Microsoft YaHei UI", 10);
         StartPosition = FormStartPosition.CenterParent;
         Size = new Size(1040, 760);

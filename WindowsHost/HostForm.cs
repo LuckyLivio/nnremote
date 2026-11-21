@@ -27,7 +27,7 @@ public sealed class HostForm : Form
 
     public HostForm()
     {
-        Text = "Livio Remote · 共享本机";
+        Text = "nnremote · 共享本机";
         Font = new Font("Microsoft YaHei UI", 10f);
         ForeColor = Ink;
         StartPosition = FormStartPosition.CenterScreen;

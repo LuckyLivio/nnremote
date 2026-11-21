@@ -7,6 +7,7 @@
     <Nullable>enable</Nullable>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <Version>0.1.0</Version>
+    <Product>nnremote</Product>
     <AssemblyName>LivioRemote</AssemblyName>
     <ApplicationIcon>LivioRemote.ico</ApplicationIcon>
   </PropertyGroup>
