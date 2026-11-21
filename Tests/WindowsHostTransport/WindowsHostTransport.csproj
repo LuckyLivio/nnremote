@@ -7,5 +7,8 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../WindowsHost/HostService.cs" Link="HostService.cs" />
+    <Compile Include="../../WindowsHost/PointerSession.cs" Link="PointerSession.cs" />
+    <Compile Include="../../Windows/ViewerLink.cs" Link="ViewerLink.cs" />
+    <Compile Include="../../Windows/PointerGeometry.cs" Link="PointerGeometry.cs" />
   </ItemGroup>
 </Project>

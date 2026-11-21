@@ -74,9 +74,6 @@ internal static class Desktop
     {
         switch (type)
         {
-            case 32 when bytes.Length == 5 && bytes[4] <= 2:
-                MoveOrClick(bytes);
-                return;
             case 35 when bytes.Length == 6:
                 short ticks = BinaryPrimitives.ReadInt16BigEndian(bytes.AsSpan(4));
                 if (ticks < -10 || ticks > 10) throw new InvalidDataException("滚轮步数无效。");
@@ -108,14 +105,20 @@ internal static class Desktop
         }
     }
 
-    private static void MoveOrClick(byte[] bytes)
+    internal static bool SetMouseButton(PointerButton button, bool down)
     {
-        if (!PositionPointer(bytes)) return;
-        if (bytes[4] == 1) Send([Mouse(0x0002), Mouse(0x0004)]);
-        if (bytes[4] == 2) Send([Mouse(0x0008), Mouse(0x0010)]);
+        uint flags = (button, down) switch
+        {
+            (PointerButton.Left, true) => 0x0002,
+            (PointerButton.Left, false) => 0x0004,
+            (PointerButton.Right, true) => 0x0008,
+            (PointerButton.Right, false) => 0x0010,
+            _ => throw new ArgumentOutOfRangeException(nameof(button)),
+        };
+        return Send([Mouse(flags)]) == 1;
     }
 
-    private static bool PositionPointer(byte[] bytes)
+    internal static bool PositionPointer(byte[] bytes)
     {
         var bounds = ScreenBounds();
         int x = bounds.X + (int)Math.Round(BinaryPrimitives.ReadUInt16BigEndian(bytes) / 65535d * (bounds.Width - 1));
@@ -123,10 +126,10 @@ internal static class Desktop
         return SetCursorPos(x, y);
     }
 
-    private static void Send(Input[] inputs)
+    private static uint Send(Input[] inputs)
     {
         // Windows may reject input to elevated/secure desktops. The host runs as the signed-in user.
-        _ = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>());
+        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>());
     }
 
     internal static void ExcludeFromCapture(Form form)

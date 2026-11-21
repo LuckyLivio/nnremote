@@ -10,11 +10,15 @@ namespace LivioRemote.Windows;
 
 internal sealed class ViewerLink : IDisposable
 {
+    private const int InputQueueLimit = 128;
+    private static readonly SslApplicationProtocol PointerProtocol = new("nnremote-pointer/1");
     private readonly TcpClient socket = new() { NoDelay = true };
     private readonly CancellationTokenSource lifetime = new();
-    private readonly SemaphoreSlim writer = new(1, 1);
+    private Task lastInput = Task.CompletedTask;
+    private int queuedInputs;
     private SslStream? tls;
     public bool MayControl { get; private set; }
+    public bool ExtendedPointer { get; private set; }
 
     public static byte[] ReadHex(string input, int bytes, bool allowSeparators)
     {
@@ -37,6 +41,7 @@ internal sealed class ViewerLink : IDisposable
         {
             TargetHost = host,
             EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+            ApplicationProtocols = [PointerProtocol],
             CertificateRevocationCheckMode = X509RevocationMode.NoCheck
         }, deadline.Token);
         await WriteAsync(1, Encoding.ASCII.GetBytes(Convert.ToHexString(secret)), deadline.Token);
@@ -45,6 +50,7 @@ internal sealed class ViewerLink : IDisposable
         var (type, length) = await HeaderAsync(deadline.Token);
         if (length != 0 || type is not (2 or 3 or 4)) throw new InvalidDataException("主机发来了无法识别的授权结果。");
         MayControl = type == 3;
+        ExtendedPointer = MayControl && tls.NegotiatedApplicationProtocol == PointerProtocol;
         return type != 4;
     }
 
@@ -103,8 +109,31 @@ internal sealed class ViewerLink : IDisposable
         return new Bitmap(img);
     }
 
-    public Task InputAsync(byte type, byte[] payload) =>
-        MayControl ? WriteAsync(type, payload, lifetime.Token) : Task.CompletedTask;
+    // Called by the UI thread. Capture the previous send before accepting the next event.
+    public Task InputAsync(byte type, byte[] payload)
+    {
+        if (!MayControl) return Task.CompletedTask;
+        if (type == 32 && (payload.Length != 5 || payload[4] > (ExtendedPointer ? 7 : 2)))
+            return Task.FromException(new InvalidDataException("主机未协商此指针指令。"));
+        if (queuedInputs >= InputQueueLimit)
+            return Task.FromException(new IOException("输入积压超过限制。"));
+        queuedInputs++;
+        lastInput = WriteInputAfterAsync(lastInput, type, payload);
+        return lastInput;
+    }
+
+    private async Task WriteInputAfterAsync(Task previous, byte type, byte[] payload)
+    {
+        try
+        {
+            await previous;
+            lifetime.Token.ThrowIfCancellationRequested();
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            deadline.CancelAfter(TimeSpan.FromSeconds(5));
+            await WriteAsync(type, payload, deadline.Token);
+        }
+        finally { queuedInputs--; }
+    }
 
     private async Task WriteAsync(byte type, byte[] data, CancellationToken ct)
     {
@@ -112,15 +141,14 @@ internal sealed class ViewerLink : IDisposable
         record[0] = type;
         BinaryPrimitives.WriteInt32BigEndian(record.AsSpan(1, 4), data.Length);
         data.CopyTo(record, 5);
-        await writer.WaitAsync(ct);
-        try { await tls!.WriteAsync(record.AsMemory(), ct); }
-        finally { writer.Release(); }
+        await tls!.WriteAsync(record.AsMemory(), ct);
     }
 
     public void Dispose()
     {
         if (lifetime.IsCancellationRequested) return;
         MayControl = false;
+        ExtendedPointer = false;
         lifetime.Cancel();
         socket.Dispose();
         tls?.Dispose();

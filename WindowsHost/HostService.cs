@@ -17,6 +17,7 @@ internal sealed class HostService : IDisposable
 {
     public const int Port = 47831;
     private const int MaxFrame = 8 * 1024 * 1024;
+    private static readonly SslApplicationProtocol PointerProtocol = new("nnremote-pointer/1");
     private readonly TcpListener listener;
     private readonly X509Certificate2 certificate;
     private readonly byte[] secret;
@@ -141,6 +142,7 @@ internal sealed class HostService : IDisposable
             {
                 ServerCertificate = certificate,
                 EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                ApplicationProtocols = [PointerProtocol],
                 ClientCertificateRequired = false
             }, deadline.Token);
             var (type, payload) = await ReadRecord(tls, 32, deadline.Token);
@@ -167,7 +169,7 @@ internal sealed class HostService : IDisposable
         status(access == Access.Control ? $"共享中 · {peer} 可控制桌面" : $"共享中 · {peer} 仅可观看", false);
         using var session = CancellationTokenSource.CreateLinkedTokenSource(stopping);
         // A failure, rejection, or disconnect on either side cuts off both input and output.
-        var receive = Receive(tls, access, session.Token);
+        var receive = Receive(tls, access, tls.NegotiatedApplicationProtocol == PointerProtocol, session.Token);
         var send = StreamDesktop(tls, session.Token);
         try { await Task.WhenAny(receive, send); }
         finally
@@ -202,19 +204,36 @@ internal sealed class HostService : IDisposable
         }
     }
 
-    private static async Task Receive(SslStream tls, Access access, CancellationToken token)
+    private static async Task Receive(SslStream tls, Access access, bool extendedPointer, CancellationToken token)
     {
+        var pointer = access == Access.Control ? new PointerSession(Desktop.PositionPointer, Desktop.SetMouseButton) : null;
         var clock = Stopwatch.StartNew();
         int count = 0;
-        while (!token.IsCancellationRequested)
+        try
         {
-            var (type, payload) = await ReadRecord(tls, 1024, token);
-            if (type == 5 && payload.Length == 0) return;
-            if (type is not (32 or 33 or 34 or 35)) throw new InvalidDataException("无效记录。");
-            if (clock.ElapsedMilliseconds >= 1000) { count = 0; clock.Restart(); }
-            if (++count > 300) throw new InvalidDataException("控制指令过于频繁。");
-            token.ThrowIfCancellationRequested();
-            if (access == Access.Control) Desktop.Apply(type, payload);
+            while (!token.IsCancellationRequested)
+            {
+                var (type, payload) = await ReadRecord(tls, 1024, token);
+                if (type == 5 && payload.Length == 0) return;
+                if (type is not (32 or 33 or 34 or 35)) throw new InvalidDataException("无效记录。");
+                if (clock.ElapsedMilliseconds >= 1000) { count = 0; clock.Restart(); }
+                if (++count > 300) throw new InvalidDataException("控制指令过于频繁。");
+                token.ThrowIfCancellationRequested();
+                if (type == 32)
+                {
+                    if (payload.Length != 5 || payload[4] > (extendedPointer ? 7 : 2))
+                        throw new InvalidDataException("无效的指针指令。");
+                    pointer?.Apply(payload);
+                }
+                else if (access == Access.Control)
+                {
+                    Desktop.Apply(type, payload);
+                }
+            }
+        }
+        finally
+        {
+            pointer?.ReleaseButtons();
         }
     }
 

@@ -10,6 +10,7 @@ private final class MHPeer {
     let link: NWConnection
     var desktop: MHDesktop?
     var control = false
+    var pointerEdges = false
     var singleUse = false
     var reader: Task<Void, Never>?
     var stream: Task<Void, Never>?
@@ -109,6 +110,7 @@ final class MHHost: ObservableObject {
             sec_protocol_options_set_min_tls_protocol_version(tls.securityProtocolOptions, .TLSv12)
             sec_protocol_options_set_local_identity(tls.securityProtocolOptions, id.identity)
             sec_protocol_options_set_peer_authentication_required(tls.securityProtocolOptions, false)
+            sec_protocol_options_add_tls_application_protocol(tls.securityProtocolOptions, PointerProtocol.name)
             let params = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
             let server = try NWListener(using: params, on: 47831)
             credentials = id
@@ -217,6 +219,7 @@ final class MHHost: ObservableObject {
                     self.finish(p, "配对口令无效")
                     return
                 }
+                p.pointerEdges = PointerProtocol.isNegotiated(on: p.link)
                 if let expiry = self.preapprovalExpiry {
                     guard Date() < expiry else { self.close("单次授权已到期"); return }
                     let control = self.preapprovedControl
@@ -237,7 +240,7 @@ final class MHHost: ObservableObject {
                         throw MHError.detail("连接发送了未经授权的控制指令。")
                     }
                     try p.checkInputRate(command, bytes: body.count)
-                    try display.apply(type: command, payload: body)
+                    try display.apply(type: command, payload: body, pointerEdges: p.pointerEdges)
                 }
             } catch { self.finish(p, error.localizedDescription) }
         }
@@ -275,6 +278,7 @@ final class MHHost: ObservableObject {
                 guard self.peer === p else { return }
                 self.status = (control ? "已允许控制" : "正在共享画面") + " · " + String(describing: p.link.endpoint)
                 while self.peer === p {
+                    guard !control || AXIsProcessTrusted() else { throw MHError.detail("辅助功能授权已撤销。") }
                     // Bound a stalled capture or send, even if the viewer stops reading.
                     self.timeout(p, seconds: 20)
                     let frame = try await display.frame()
@@ -298,6 +302,8 @@ final class MHHost: ObservableObject {
 
     private func finish(_ p: MHPeer, _ reason: String) {
         guard peer === p else { return }
+        p.control = false
+        p.desktop?.releasePointerButtons()
         peer = nil
         p.deadline?.cancel()
         p.reader?.cancel()

@@ -7,7 +7,7 @@ import CoreGraphics
 
 enum ViewerEvent {
     case awaitingApproval
-    case approved(control: Bool)
+    case approved(control: Bool, pointerEdges: Bool)
     case frame(CGImage)
     case ended(String)
 }
@@ -19,8 +19,28 @@ struct ViewerEndpoint {
     let secret: String
 }
 
+enum PointerProtocol {
+    static let name = "nnremote-pointer/1"
+
+    static func isNegotiated(on connection: NWConnection) -> Bool {
+        guard let tls = connection.metadata(definition: NWProtocolTLS.definition) as? NWProtocolTLS.Metadata else {
+            return false
+        }
+        let metadata = tls.securityProtocolMetadata
+        if #available(iOS 18.5, macOS 15.5, *) {
+            guard let value = sec_protocol_metadata_copy_negotiated_protocol(metadata) else { return false }
+            defer { free(UnsafeMutableRawPointer(mutating: value)) }
+            return String(cString: value) == name
+        }
+        guard let value = sec_protocol_metadata_get_negotiated_protocol(metadata) else { return false }
+        return String(cString: value) == name
+    }
+}
+
 final class ViewerTransport {
-    private enum Stage { case connecting, approval, streaming, ended }
+    private enum Stage { case connecting, approval, streaming, closing, ended }
+    private static let moveInterval: DispatchTimeInterval = .milliseconds(16)
+    private static let maximumPendingWrites = 128
     private let endpoint: ViewerEndpoint
     private let onEvent: (ViewerEvent) -> Void
     private let queue = DispatchQueue(label: "LivioRemote.Viewer")
@@ -28,6 +48,15 @@ final class ViewerTransport {
     private var timeout: DispatchSourceTimer?
     private var stage: Stage = .connecting
     private var canControl = false
+    private var pointerEdges = false
+    private var leftHeld = false
+    private var rightHeld = false
+    private var pointerPosition: (x: UInt16, y: UInt16) = (32768, 32768)
+    private var pendingMove: Data?
+    private var pendingWrites: [Data] = []
+    private var writingInput = false
+    private var moveTimerScheduled = false
+    private var nextMoveAt = DispatchTime.now()
     private var pinAccepted = false
     private var pinFailed = false
     private let maximumFrame = 8 * 1024 * 1024
@@ -38,10 +67,11 @@ final class ViewerTransport {
     }
 
     func start() {
-        queue.async {
+        queue.async { [self] in
             guard self.stage == .connecting else { return }
             let tls = NWProtocolTLS.Options()
             sec_protocol_options_set_min_tls_protocol_version(tls.securityProtocolOptions, .TLSv12)
+            sec_protocol_options_add_tls_application_protocol(tls.securityProtocolOptions, PointerProtocol.name)
             sec_protocol_options_set_verify_block(tls.securityProtocolOptions, { [weak self] _, peerTrust, complete in
                 guard let self = self else { complete(false); return }
                 let trust = sec_trust_copy_ref(peerTrust).takeRetainedValue()
@@ -71,7 +101,7 @@ final class ViewerTransport {
                 case .connecting: self.finish("连接超时，请核对主机地址、端口和网络。")
                 case .approval: self.finish("等待主机确认超时。")
                 case .streaming: self.finish("主机长时间未发送画面，连接已结束。")
-                case .ended: break
+                case .closing, .ended: break
                 }
             }
             self.timeout = timer
@@ -84,6 +114,9 @@ final class ViewerTransport {
                 case .ready:
                     guard self.stage == .connecting else { return }
                     guard self.pinAccepted else { self.finish("未能校验主机证书，连接已取消。"); return }
+                    if let activeConnection = self.connection {
+                        self.pointerEdges = PointerProtocol.isNegotiated(on: activeConnection)
+                    }
                     self.stage = .approval
                     self.armTimeout(95)
                     self.deliver(.awaitingApproval)
@@ -101,26 +134,73 @@ final class ViewerTransport {
 
     func stop() {
         queue.async {
-            guard self.stage == .streaming, let connection = self.connection else {
+            guard self.stage != .closing else { return }
+            guard self.stage == .streaming else {
                 self.finish("已断开。")
                 return
             }
-            // Closing the transport also lets the host detect a disconnect if the end record is lost.
-            let end = Self.record(5, Data())
-            self.stage = .ended
+            self.releaseHeldButtons()
+            guard self.stage == .streaming else { return }
+            self.stage = .closing
             self.timeout?.cancel()
             self.timeout = nil
-            self.connection = nil
-            connection.stateUpdateHandler = nil
-            connection.send(content: end, completion: .contentProcessed { _ in connection.cancel() })
-            self.queue.asyncAfter(deadline: .now() + 1) { connection.cancel() }
+            self.enqueueReliable(Self.record(5, Data()))
+            // Keep the closing transport alive until the ordered releases and end record drain.
+            self.queue.asyncAfter(deadline: .now() + 1) { self.finish("已断开。") }
         }
     }
 
     func pointer(x: UInt16, y: UInt16, action: UInt8) {
-        var payload = Self.positionBytes(x, y)
+        queue.async {
+            guard self.stage == .streaming, self.canControl,
+                  action <= (self.pointerEdges ? 7 : 2) else { return }
+            switch action {
+            case 3:
+                guard !self.leftHeld else { return }
+                self.leftHeld = true
+            case 4:
+                guard self.leftHeld else { return }
+                self.leftHeld = false
+            case 5:
+                guard !self.rightHeld else { return }
+                self.rightHeld = true
+            case 6:
+                guard self.rightHeld else { return }
+                self.rightHeld = false
+            default: break
+            }
+            self.pointerPosition = (x, y)
+            let record = Self.pointerRecord(x, y, action)
+            if action == 0 {
+                self.pendingMove = record
+                self.pumpInput()
+            } else {
+                self.enqueueReliable(record)
+            }
+        }
+    }
+
+    func releasePointerButtons() {
+        queue.async { self.releaseHeldButtons() }
+    }
+
+    private func releaseHeldButtons() {
+        guard stage == .streaming, canControl, pointerEdges else { return }
+        let (x, y) = pointerPosition
+        if leftHeld {
+            leftHeld = false
+            enqueueReliable(Self.pointerRecord(x, y, 4))
+        }
+        if rightHeld {
+            rightHeld = false
+            enqueueReliable(Self.pointerRecord(x, y, 6))
+        }
+    }
+
+    private static func pointerRecord(_ x: UInt16, _ y: UInt16, _ action: UInt8) -> Data {
+        var payload = positionBytes(x, y)
         payload.append(action)
-        sendInput(32, payload)
+        return record(32, payload)
     }
 
     func scroll(x: UInt16, y: UInt16, ticks: Int16) {
@@ -129,7 +209,7 @@ final class ViewerTransport {
         var payload = Self.positionBytes(x, y)
         payload.append(UInt8(bits >> 8))
         payload.append(UInt8(truncatingIfNeeded: bits))
-        sendInput(35, payload)
+        sendInput(35, payload, at: (x, y))
     }
 
     private static func positionBytes(_ x: UInt16, _ y: UInt16) -> Data {
@@ -145,11 +225,63 @@ final class ViewerTransport {
 
     func sendKey(_ code: UInt8) { sendInput(34, Data([code])) }
 
-    private func sendInput(_ type: UInt8, _ payload: Data) {
+    private func sendInput(_ type: UInt8, _ payload: Data, at position: (x: UInt16, y: UInt16)? = nil) {
         queue.async {
             guard self.stage == .streaming, self.canControl else { return }
-            self.write(type, payload)
+            if let position = position { self.pointerPosition = position }
+            self.enqueueReliable(Self.record(type, payload))
         }
+    }
+
+    private func enqueueReliable(_ record: Data) {
+        guard stage == .streaming || stage == .closing else { return }
+        let extra = pendingMove == nil ? 1 : 2
+        guard pendingWrites.count + extra <= Self.maximumPendingWrites else {
+            finish("网络暂时无法发送输入，连接已结束。")
+            return
+        }
+        if let pendingMove = pendingMove {
+            pendingWrites.append(pendingMove)
+            self.pendingMove = nil
+            nextMoveAt = .now() + Self.moveInterval
+        }
+        pendingWrites.append(record)
+        pumpInput()
+    }
+
+    private func pumpInput() {
+        guard !writingInput, let connection = connection else { return }
+        let record: Data
+        if !pendingWrites.isEmpty {
+            record = pendingWrites.removeFirst()
+        } else if let move = pendingMove {
+            if DispatchTime.now() < nextMoveAt {
+                guard !moveTimerScheduled else { return }
+                moveTimerScheduled = true
+                queue.asyncAfter(deadline: nextMoveAt) { [weak self] in
+                    guard let self = self else { return }
+                    self.moveTimerScheduled = false
+                    self.pumpInput()
+                }
+                return
+            }
+            record = move
+            pendingMove = nil
+            nextMoveAt = .now() + Self.moveInterval
+        } else {
+            if stage == .closing { finish("已断开。") }
+            return
+        }
+        writingInput = true
+        connection.send(content: record, completion: .contentProcessed { [weak self] error in
+            guard let self = self, self.stage != .ended else { return }
+            self.writingInput = false
+            if let error = error {
+                self.finish("发送失败：\(error.localizedDescription)")
+            } else {
+                self.pumpInput()
+            }
+        })
     }
 
     private func armTimeout(_ seconds: Int) {
@@ -157,7 +289,7 @@ final class ViewerTransport {
     }
 
     private func readHeader() {
-        guard stage != .ended else { return }
+        guard stage != .closing, stage != .ended else { return }
         receiveExact(5) { [weak self] data in
             guard let self = self else { return }
             let bytes = [UInt8](data)
@@ -169,7 +301,7 @@ final class ViewerTransport {
                 self.canControl = type == 3
                 self.stage = .streaming
                 self.armTimeout(30)
-                self.deliver(.approved(control: self.canControl))
+                self.deliver(.approved(control: self.canControl, pointerEdges: self.pointerEdges))
                 self.readHeader()
             case (.approval, 4):
                 self.finish(length == 0 ? "主机拒绝了请求，请核对配对密钥并请主机用户确认。" : "主机拒绝消息格式错误。")
@@ -206,10 +338,10 @@ final class ViewerTransport {
     private func receiveExact(_ size: Int, completion: @escaping (Data) -> Void) {
         var received = Data()
         func next() {
-            guard stage != .ended, let connection = connection else { return }
+            guard stage != .closing, stage != .ended, let connection = connection else { return }
             let remaining = size - received.count
             connection.receive(minimumIncompleteLength: 1, maximumLength: min(remaining, 128 * 1024)) { [weak self] data, _, eof, error in
-                guard let self = self, self.stage != .ended else { return }
+                guard let self = self, self.stage != .closing, self.stage != .ended else { return }
                 if let error = error {
                     self.finish("连接中断：\(error.localizedDescription)")
                     return
@@ -244,6 +376,10 @@ final class ViewerTransport {
     private func finish(_ message: String) {
         guard stage != .ended else { return }
         stage = .ended
+        pendingMove = nil
+        pendingWrites.removeAll()
+        leftHeld = false
+        rightHeld = false
         timeout?.cancel()
         timeout = nil
         connection?.stateUpdateHandler = nil

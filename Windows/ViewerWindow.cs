@@ -19,6 +19,12 @@ internal sealed class ViewerWindow : Form
     private readonly TableLayoutPanel fields = new() { AutoSize = true, ColumnCount = 3, Dock = DockStyle.Top };
     private ViewerLink? current;
     private ushort pointerX = 32768, pointerY = 32768;
+    private MouseButtons pressedButtons;
+    private bool recaptureAfterMouseUp;
+    private readonly System.Windows.Forms.Timer pointerTimer = new() { Interval = 16 };
+    private bool movePending;
+    private Task? moveWrite;
+    private int wheelRemainder;
     private readonly Button paste = new() { Text = "粘贴连接邀请", AutoSize = true };
 
 
@@ -70,29 +76,28 @@ internal sealed class ViewerWindow : Form
         foreach (var (label, ticks) in new[] { ("上滚", 3), ("下滚", -3) })
         {
             var button = new Button { Text = label, AutoSize = true };
-            button.Click += async (_, _) => await SendScroll(pointerX, pointerY, ticks);
+            button.Click += async (_, _) => await QueueScroll(pointerX, pointerY, ticks);
             inputBar.Controls.Add(button);
         }
-        screen.MouseWheel += async (_, e) =>
+        screen.MouseMove += (_, e) => PointerMoved(e.Location);
+        screen.MouseDown += async (_, e) => await PointerDown(e);
+        screen.MouseUp += async (_, e) => await PointerUp(e);
+        screen.MouseCaptureChanged += async (_, _) =>
         {
-            var img = screen.Image;
-            if (img == null || e.Delta == 0 ||
-                !TryMap(screen.ClientSize, img.Size, e.Location, out var x, out var y)) return;
-            int ticks = Math.Clamp(e.Delta / 120, -10, 10);
-            await SendScroll(x, y, ticks == 0 ? Math.Sign(e.Delta) : ticks);
+            // WinForms drops capture after every mouse-up, even when another button is still down.
+            if (recaptureAfterMouseUp && !screen.Capture && Form.ActiveForm == this)
+            {
+                recaptureAfterMouseUp = false;
+                screen.Capture = true;
+            }
+            if (!screen.Capture) await ReleaseButtons();
         };
-        screen.MouseClick += async (_, e) =>
+        Deactivate += async (_, _) => await ReleaseButtons();
+        screen.MouseWheel += async (_, e) => await ScrollAt(screen.PointToScreen(e.Location), e);
+        MouseWheel += async (_, e) => await ScrollAt(PointToScreen(e.Location), e);
+        pointerTimer.Tick += (_, _) =>
         {
-            if (e.Button is not (MouseButtons.Left or MouseButtons.Right)) return;
-            var img = screen.Image;
-            if (img is null || !TryMap(screen.ClientSize, img.Size, e.Location, out var x, out var y)) return;
-            pointerX = x;
-            pointerY = y;
-            byte[] payload = new byte[5];
-            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(0, 2), x);
-            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(2, 2), y);
-            payload[4] = (byte)(e.Button == MouseButtons.Right ? 2 : 1);
-            await SendInput(32, payload);
+            if (moveWrite?.IsCompleted != false) moveWrite = FlushPendingMove();
         };
         connect.Click += async (_, _) =>
         {
@@ -103,13 +108,103 @@ internal sealed class ViewerWindow : Form
         Controls.Add(layout);
     }
 
-    private async Task SendScroll(ushort x, ushort y, int ticks)
+    private bool MapPointer(Point location, bool clamp, out ushort x, out ushort y)
     {
+        x = y = 0;
+        return screen.Image is { } img && PointerGeometry.TryMap(screen.ClientSize, img.Size, location, out x, out y, clamp);
+    }
+
+    private void PointerMoved(Point location)
+    {
+        if (current?.ExtendedPointer != true || Form.ActiveForm != this ||
+            !MapPointer(location, pressedButtons != MouseButtons.None, out var x, out var y)) return;
+        if (x == pointerX && y == pointerY) return;
+        (pointerX, pointerY) = (x, y);
+        movePending = true;
+    }
+
+    private Task PointerDown(MouseEventArgs e)
+    {
+        if (current?.MayControl != true || e.Button is not (MouseButtons.Left or MouseButtons.Right) ||
+            pressedButtons.HasFlag(e.Button) || !MapPointer(e.Location, false, out var x, out var y))
+            return Task.CompletedTask;
+        pressedButtons |= e.Button;
+        screen.Capture = true;
+        return current.ExtendedPointer ? QueuePointer(x, y, e.Button == MouseButtons.Left ? (byte)3 : (byte)5)
+            : Task.CompletedTask;
+    }
+
+    private Task PointerUp(MouseEventArgs e)
+    {
+        if (e.Button is not (MouseButtons.Left or MouseButtons.Right) || !pressedButtons.HasFlag(e.Button))
+            return Task.CompletedTask;
+        pressedButtons &= ~e.Button;
+        recaptureAfterMouseUp = pressedButtons != MouseButtons.None;
+        if (current?.ExtendedPointer == true)
+        {
+            if (!MapPointer(e.Location, true, out var x, out var y)) (x, y) = (pointerX, pointerY);
+            return QueuePointer(x, y, e.Button == MouseButtons.Left ? (byte)4 : (byte)6);
+        }
+        return MapPointer(e.Location, false, out var clickX, out var clickY)
+            ? QueuePointer(clickX, clickY, e.Button == MouseButtons.Left ? (byte)1 : (byte)2)
+            : Task.CompletedTask;
+    }
+
+    private Task ReleaseButtons()
+    {
+        var held = pressedButtons;
+        pressedButtons = MouseButtons.None;
+        recaptureAfterMouseUp = false;
+        if (screen.Capture) screen.Capture = false;
+        if (current?.ExtendedPointer != true || held == MouseButtons.None) return Task.CompletedTask;
+        return Task.WhenAll(
+            held.HasFlag(MouseButtons.Left) ? QueuePointer(pointerX, pointerY, 4) : Task.CompletedTask,
+            held.HasFlag(MouseButtons.Right) ? QueuePointer(pointerX, pointerY, 6) : Task.CompletedTask);
+    }
+
+    private Task FlushPendingMove()
+    {
+        if (!movePending) return Task.CompletedTask;
+        movePending = false;
+        return SendPointer(pointerX, pointerY, 0);
+    }
+
+    private Task QueuePointer(ushort x, ushort y, byte action)
+    {
+        var precedingMove = FlushPendingMove();
+        (pointerX, pointerY) = (x, y);
+        return Task.WhenAll(precedingMove, SendPointer(x, y, action));
+    }
+
+    private Task SendPointer(ushort x, ushort y, byte action)
+    {
+        byte[] payload = new byte[5];
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(0, 2), x);
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(2, 2), y);
+        payload[4] = action;
+        return SendInput(32, payload);
+    }
+
+    private Task ScrollAt(Point screenLocation, MouseEventArgs e)
+    {
+        if (current?.MayControl != true || !MapPointer(screen.PointToClient(screenLocation), false, out var x, out var y))
+            return Task.CompletedTask;
+        if (e is HandledMouseEventArgs handled) handled.Handled = true;
+        wheelRemainder += e.Delta;
+        int ticks = Math.Clamp(wheelRemainder / 120, -10, 10);
+        wheelRemainder %= 120;
+        return ticks == 0 ? Task.CompletedTask : QueueScroll(x, y, ticks);
+    }
+
+    private Task QueueScroll(ushort x, ushort y, int ticks)
+    {
+        var precedingMove = FlushPendingMove();
+        (pointerX, pointerY) = (x, y);
         byte[] payload = new byte[6];
         BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(0, 2), x);
         BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(2, 2), y);
         BinaryPrimitives.WriteInt16BigEndian(payload.AsSpan(4, 2), (short)ticks);
-        await SendInput(35, payload);
+        return Task.WhenAll(precedingMove, SendInput(35, payload));
     }
 
     private void ImportInvitation()
@@ -141,19 +236,6 @@ internal sealed class ViewerWindow : Form
         fields.Controls.Add(control, 1, row);
     }
 
-    internal static bool TryMap(Size area, Size image, Point point, out ushort x, out ushort y)
-    {
-        x = y = 0;
-        if (image.Width <= 0 || image.Height <= 0) return false;
-        double scale = Math.Min((double)area.Width / image.Width, (double)area.Height / image.Height);
-        int w = (int)(scale * image.Width), h = (int)(scale * image.Height);
-        int dx = point.X - (area.Width - w) / 2, dy = point.Y - (area.Height - h) / 2;
-        if (dx < 0 || dx >= w || dy < 0 || dy >= h) return false;
-        x = (ushort)Math.Round(dx * 65535.0 / Math.Max(1, w - 1));
-        y = (ushort)Math.Round(dy * 65535.0 / Math.Max(1, h - 1));
-        return true;
-    }
-
     private async Task StartAsync()
     {
         string host = address.Text.Trim();
@@ -178,7 +260,9 @@ internal sealed class ViewerWindow : Form
             if (!approved) { outcome = "主机拒绝连接或配对密钥无效。"; return; }
             secret.Clear();
             inputBar.Visible = session.MayControl;
-            status.Text = session.MayControl ? "已连接 · 可控制，点击画面操作" : "已连接 · 仅查看";
+            status.Text = session.ExtendedPointer ? "已连接 · 可拖动、双击及滚动" : session.MayControl
+                ? "已连接 · 可点击和滚动，升级主机后可拖动" : "已连接 · 仅查看";
+            if (session.ExtendedPointer) pointerTimer.Start();
             while (current == session)
             {
                 var frame = await session.NextFrameAsync();
@@ -214,6 +298,13 @@ internal sealed class ViewerWindow : Form
         var session = current;
         current = null;
         session?.Dispose();
+        pointerTimer.Stop();
+        movePending = false;
+        moveWrite = null;
+        wheelRemainder = 0;
+        pressedButtons = MouseButtons.None;
+        recaptureAfterMouseUp = false;
+        if (screen.Capture) screen.Capture = false;
         inputBar.Visible = false;
         textInput.Clear();
         var frame = screen.Image;
@@ -224,5 +315,11 @@ internal sealed class ViewerWindow : Form
         pointerX = pointerY = 32768;
         connect.Text = "连接";
         status.Text = message;
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) pointerTimer.Dispose();
+        base.Dispose(disposing);
     }
 }
